@@ -219,3 +219,66 @@ Any model on OpenRouter works. Swap `MODEL` in `.env`:
 | [selector.py](selector.py) | TTS@N cross-test matrix and candidate selection |
 | [swebench_utils.py](swebench_utils.py) | HuggingFace loading, git repo setup, Docker eval |
 | [run.py](run.py) | CLI: `solve`, `batch`, `list`, `evaluate` commands |
+| [visual_memory.py](visual_memory.py) | AST call/import graph builder + VLM description |
+| [self_harness.py](self_harness.py) | Self-improving harness: mine → improve → solve |
+
+---
+
+## Self-Harness (Automated Prompt Improvement)
+
+Based on the Self-Harness paper (Zhang et al., 2606.09498), the harness can improve its
+own system prompts by learning from past failures — with zero changes to existing code.
+
+### The idea
+
+Every failure leaves a trace in `_share/phase_log.jsonl`:
+- Which phase gave up
+- Which required assets were missing
+
+After running a batch of instances, those traces reveal systematic patterns
+("VERIFY_PATCH gives up 40% of the time, always missing `verify_log.txt`"). An LLM
+then proposes minimal, targeted additions to the system prompts to address those patterns.
+The improved prompts are stored in `self_harness_config.json` and injected at runtime
+by `LearnedInstanceHarness` — a subclass of `InstanceHarness` that adds one override.
+
+### What gets improved
+
+Self-Harness only improves **what the agent is told** (prompt text), not the pipeline
+structure (phases, tools, order). Phase additions are appended to the existing prompts —
+existing instructions are never rewritten.
+
+### Workflow
+
+```bash
+# 1. Run a batch of instances with the standard harness first
+python run.py batch --ids-file my_ids.txt --tts 1
+
+# 2. Mine failure patterns from all past runs
+python self_harness.py mine --results-dir results/
+# → saves self_harness_failures.json
+
+# 3. LLM proposes targeted prompt additions
+python self_harness.py improve
+# → saves self_harness_config.json  (versioned, never overwrites without incrementing)
+
+# 4. Run new instances with the learned harness
+python self_harness.py solve --instance django__django-11099
+# → writes to predictions_learned.jsonl (separate from predictions.jsonl)
+
+# 5. Inspect what was learned
+python self_harness.py show
+```
+
+### How isolation is maintained
+
+`LearnedInstanceHarness._run_phase()` temporarily patches `self.state.context_summary`
+(a bound method on the *instance*, not the class) to append learned content, calls
+`super()._run_phase()`, then restores the original in a `finally` block.
+If no learned config exists yet, it calls `super()` directly with zero overhead.
+`harness.py`, `phases.py`, and all other files are never modified.
+
+### Prerequisite
+
+You need at least ~20–50 runs before the failure patterns are meaningful enough to
+mine. Each instance takes ~20–60 minutes, so this is a one-time offline step after
+a batch run — not per-instance overhead.
